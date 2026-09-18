@@ -14,6 +14,10 @@
 #include "timer.h"
 #include "archive.h"
 
+#include <climits>
+#include <ctime>
+#include <memory>
+
 #include <openssl/ocsp.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
@@ -262,6 +266,10 @@ int checkCert(
 	}
 		
 	X509* cert = (X509*)zsa.m_x509Cert;
+	if (!cert) {
+		completionHandler(2, nil, @"Error loading certificate");
+		return -4;
+	}
 	BIO *brother1;
 	unsigned long issuerHash = X509_issuer_name_hash((X509*)cert);
 	if (0x817d2f7a == issuerHash) {
@@ -330,49 +338,75 @@ int checkCert(
 	X509_free(issuer);
 	BIO_free(brother1);
 	
+	// Read the date before starting the request, so the asynchronous
+	// completion does not need a borrowed certificate pointer.
+	NSDate *expirationDate = nil;
+	const ASN1_TIME *expirationTime = X509_get0_notAfter(cert);
+	struct tm expirationComponents = {};
+	if (expirationTime && ASN1_TIME_to_tm(expirationTime, &expirationComponents) == 1) {
+		NSDateComponents *components = [[NSDateComponents alloc] init];
+		components.year = expirationComponents.tm_year + 1900;
+		components.month = expirationComponents.tm_mon + 1;
+		components.day = expirationComponents.tm_mday;
+		components.hour = expirationComponents.tm_hour;
+		components.minute = expirationComponents.tm_min;
+		components.second = expirationComponents.tm_sec;
+		NSCalendar *calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+		calendar.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+		expirationDate = [calendar dateFromComponents:components];
+	}
+
+	// A copied completion block retains this ID, including on error/cancellation.
+	const std::shared_ptr<OCSP_CERTID> responseCertID(cert_id, OCSP_CERTID_free);
 	NSURLSession *session = [NSURLSession sharedSession];
 	NSURLSessionDataTask *task = [session dataTaskWithRequest:request
-											completionHandler:^(NSData * _Nullable data,
-																NSURLResponse * _Nullable response,
-																NSError * _Nullable error) {
+		completionHandler:^(NSData * _Nullable data,
+			NSURLResponse * _Nullable response,
+			NSError * _Nullable error) {
 		if (error) {
 			completionHandler(2, nil, error.localizedDescription);
 			return;
 		}
-		
-		NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-		if (httpResponse.statusCode == 200 && data) {
-			const void *respBytes = [data bytes];
-			OCSP_RESPONSE *resp;
-			d2i_OCSP_RESPONSE(&resp, (const unsigned char**)&respBytes, data.length);
-			OCSP_BASICRESP *basic = OCSP_response_get1_basic(resp);
-			ASN1_TIME *expirationDateAsn1 = X509_get_notAfter(cert);
-			NSString *fullDateString = [NSString stringWithFormat:@"20%s", expirationDateAsn1->data];
-			
-			NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-			formatter.dateFormat = @"yyyyMMddHHmmss'Z'";
-			formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-			formatter.locale = NSLocale.currentLocale;
-			NSDate *expirationDate = [formatter dateFromString:fullDateString];
-			
-			int status, reason;
-			if (OCSP_resp_find_status(basic, cert_id, &status, &reason, NULL, NULL, NULL)) {
-				completionHandler(status, expirationDate, nil);
-			} else {
-				completionHandler(2, expirationDate, nil);
-			}
-			
-			OCSP_CERTID_free(cert_id);
-			OCSP_BASICRESP_free(basic);
-			OCSP_RESPONSE_free(resp);
-			
-			
-		} else {
+
+		if (![response isKindOfClass:[NSHTTPURLResponse class]] ||
+			[(NSHTTPURLResponse *)response statusCode] != 200 ||
+			!data || data.length == 0 || data.length > LONG_MAX) {
 			completionHandler(2, nil, @"Invalid response or no data");
 			return;
 		}
+
+		const unsigned char *respBytes = static_cast<const unsigned char *>(data.bytes);
+		const unsigned char *responseEnd = respBytes + data.length;
+		// nullptr requests a new object; never pass an uninitialized output pointer.
+		std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)> resp(
+			d2i_OCSP_RESPONSE(nullptr, &respBytes, static_cast<long>(data.length)),
+			OCSP_RESPONSE_free);
+		if (!resp || respBytes != responseEnd) {
+			completionHandler(2, nil, @"Unable to decode OCSP response");
+			return;
+		}
+		if (OCSP_response_status(resp.get()) != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
+			completionHandler(2, nil, @"OCSP responder returned an error");
+			return;
+		}
+
+		std::unique_ptr<OCSP_BASICRESP, decltype(&OCSP_BASICRESP_free)> basic(
+			OCSP_response_get1_basic(resp.get()), OCSP_BASICRESP_free);
+		if (!basic || !responseCertID) {
+			completionHandler(2, nil, @"Missing OCSP response details or certificate ID");
+			return;
+		}
+
+		int status = V_OCSP_CERTSTATUS_UNKNOWN;
+		int reason = 0;
+		if (OCSP_resp_find_status(basic.get(), responseCertID.get(),
+			&status, &reason, nullptr, nullptr, nullptr)) {
+			completionHandler(status, expirationDate, nil);
+		} else {
+			completionHandler(2, expirationDate, @"Certificate not found in OCSP response");
+		}
 	}];
-	
+
 	[task resume];
 	return 1;
 }
