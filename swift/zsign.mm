@@ -98,7 +98,7 @@ bool UninstallDylibs(NSString *filePath, NSArray<NSString *> *dylibPathsArray) {
 			return false;
 		}
 		
-		machO.RemoveDylib(dylibsToRemove);
+		machO.RemoveDylibs(dylibsToRemove);
 		
 		machO.Free();
 		
@@ -228,15 +228,7 @@ int zsign(
 	ZLog::PrintV(">>> Signing:\t%s %s\n", strPath.c_str(), (bAdhoc ? " (Ad-hoc)" : ""));
 	atimer.PrintResult(bRet, ">>> Signed %s!", bRet ? "OK" : "Failed");
 	
-	NSError* signError = nil;
-	if(!bundle.signFailedFiles.empty()) {
-		NSDictionary* userInfo = @{
-			NSLocalizedDescriptionKey : [NSString stringWithUTF8String:bundle.signFailedFiles.c_str()]
-		};
-		signError = [NSError errorWithDomain:@"Failed to Sign" code:-1 userInfo:userInfo];
-	}
-	
-	completionHandler(bRet, signError);
+	completionHandler(bRet);
 	
 	gtimer.Print(">>> Done.");
 	return bRet ? 0 : -1;
@@ -327,7 +319,7 @@ int checkCert(
 	
 	OCSP_REQUEST* req = OCSP_REQUEST_new();
 	OCSP_CERTID* cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
-	OCSP_request_add0_id(req, cert_id);  // Ownership transferred to request
+	OCSP_request_add0_id(req, cert_id);
 	cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
 	unsigned char* der = 0;
 	int len = i2d_OCSP_REQUEST(req, &der);
