@@ -19,7 +19,7 @@ let package = Package(
 		),
 		.library(
 			name: "Zsign",
-			targets: ["Zsign"]
+			targets: ["Zsign", "ZsignC"]
 		),
 	],
 	dependencies: [
